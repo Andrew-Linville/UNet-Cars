@@ -159,3 +159,33 @@ def log_val_preds_tb(
         writer.add_image(f"{tag_prefix}/batch{b_idx}", grid, epoch)
 
     model.train()
+
+@torch.no_grad()
+def uncert_map_TB(loader,
+    model,
+    writer,
+    epoch: int,
+    device: str = "cuda",
+):
+
+    model.eval()
+    with torch.no_grad():
+        data, _ = next(iter(loader))
+        data = data.to(device)
+        out = model(data)
+        if isinstance(out, (tuple, list)):
+            logits, cov = out
+        else:
+            logits, cov = out, None
+
+        if cov is not None:
+            preds = torch.sigmoid(logits)
+            # Compute pixelwise uncertainty (variance of GP output)
+            uncertainty = torch.diagonal(cov).reshape_as(preds)
+
+            # Normalize for visualization
+            uncertainty = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
+
+            # Log to TensorBoard (first image only)
+            writer.add_image("uncertainty_map", uncertainty[0], epoch)
+    model.train()
