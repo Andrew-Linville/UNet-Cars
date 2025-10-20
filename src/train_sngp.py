@@ -1,184 +1,202 @@
+# train_sngp.py
+import argparse
+from pathlib import Path
+
 import torch
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from model import UNET
-from utils import (
+from tqdm import tqdm
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.tensorboard import SummaryWriter
+
+from model_sngp import UNET_SNGP
+
+
+from utils_sngp import (
     load_checkpoint,
     save_checkpoint,
     get_loaders,
     check_accuracy,
-    save_predictions_as_imgs,
-    TB_preds_vis,
     log_val_preds_tb,
     uncert_map_TB,
 )
 
-#? Get the run directory
-import argparse, os, json
-from pathlib import Path
-p = argparse.ArgumentParser()
-p.add_argument("--logdir",  default=None)   # <-- add this
-args = p.parse_args()
-RUN_DIR   = Path(args.logdir)
 
-#? Initialize TensorBoard
-from torch.utils.tensorboard import SummaryWriter
+# Config / Arguments
+
+p = argparse.ArgumentParser()
+p.add_argument("--logdir", default=None)
+p.add_argument("--epochs", type=int, default=10)
+p.add_argument("--lr", type=float, default=1e-4)
+p.add_argument("--batch_size", type=int, default=64)
+p.add_argument("--img_h", type=int, default=160)
+p.add_argument("--img_w", type=int, default=240)
+p.add_argument("--ridge", type=float, default=1.0)
+p.add_argument("--rff_dim", type=int, default=512)
+p.add_argument("--reduction_dim", type=int, default=64)
+p.add_argument("--chunk_pixels", type=int, default=8192)
+p.add_argument("--load_ckpt", action="store_true")
+args = p.parse_args()
+
+RUN_DIR = Path(args.logdir or "runs/sngp_default")
+RUN_DIR.mkdir(parents=True, exist_ok=True)
 writer = SummaryWriter(RUN_DIR)
 
-# Hyperparameters etc.
-LEARNING_RATE = 1e-4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 64
-NUM_EPOCHS = 200
-NUM_WORKERS = 4
-IMAGE_HEIGHT = 160  # 1280 originally
-IMAGE_WIDTH = 240  # 1918 originally
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIN_MEMORY = True
-LOAD_MODEL = False
+NUM_WORKERS = 4
+
 TRAIN_IMG_DIR = "data/train_images/"
 TRAIN_MASK_DIR = "data/train_masks/"
-VAL_IMG_DIR = "data/val_images/"
-VAL_MASK_DIR = "data/val_masks/"
+VAL_IMG_DIR   = "data/val_images/"
+VAL_MASK_DIR  = "data/val_masks/"
 
-def train_fn(loader, model, optimizer, loss_fn, scaler, epoch_0=False):
+
+# Train utils
+
+def _only_logits(out):
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+def set_variance(model, flag):
+    if hasattr(model, "classifier"):
+        model.classifier.enable_variance(bool(flag))
+
+def train_epoch(loader, model, opt, loss_fn, scaler):
+    model.train()
+    set_variance(model, False)  # no variance during training
+    running = 0.0
     loop = tqdm(loader)
-    running_loss = 0.0
+    for x, y in loop:
+        x = x.to(DEVICE, non_blocking=True)
+        y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
 
-    for batch_idx, (data, targets) in enumerate(loop):
-        data = data.to(device=DEVICE)
-        targets = targets.float().unsqueeze(1).to(device=DEVICE)
+        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+            out = model(x)
+            logits = _only_logits(out)
+            loss = loss_fn(logits, y)
 
-        with torch.cuda.amp.autocast():
-            out = model(data)
-            predictions = out[0] if isinstance(out, (tuple, list)) else out
-            loss = loss_fn(predictions, targets)
-
-        running_loss += loss.item()
-        optimizer.zero_grad()
+        opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
+        scaler.step(opt)
         scaler.update()
-        loop.set_postfix(loss=loss.item())
 
-    average_loss = running_loss / len(loader)
-    return average_loss
-
+        running += float(loss.item())
+        loop.set_postfix(loss=float(loss.item()))
+    return running / max(1, len(loader))
 
 @torch.no_grad()
-def eval_loss(loader, model, loss_fn, device="cuda", max_batches=None, use_amp=True):
+def eval_loss(loader, model, loss_fn):
     model.eval()
+    set_variance(model, False)  # keep plain logits for loss
     total, n = 0.0, 0
-    for b, (x, y) in enumerate(loader):
-        if max_batches is not None and b >= max_batches: break
-        x = x.to(device)
-        y = y.float().unsqueeze(1).to(device)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            logits = model(x)
+    for x, y in loader:
+        x = x.to(DEVICE, non_blocking=True)
+        y = y.float().unsqueeze(1).to(DEVICE, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+            out = model(x)
+            logits = _only_logits(out)
             loss = loss_fn(logits, y)
-        total += float(loss.item())
-        n += 1
+        total += float(loss.item()); n += 1
     model.train()
-    return total / max(n, 1)
+    return total / max(1, n)
 
+# Main 
 
 def main():
-    train_transform = A.Compose(
-        [
-            A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-            A.Rotate(limit=35, p=1.0),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.1),
-            A.Normalize(
-                mean=[0.0, 0.0, 0.0],
-                std=[1.0, 1.0, 1.0],
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ],
-    )
+    train_tf = A.Compose([
+        A.Resize(height=args.img_h, width=args.img_w),
+        A.Rotate(limit=35, p=1.0),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.1),
+        A.Normalize(mean=[0.,0.,0.], std=[1.,1.,1.], max_pixel_value=255.0),
+        ToTensorV2(),
+    ])
+    val_tf = A.Compose([
+        A.Resize(height=args.img_h, width=args.img_w),
+        A.Normalize(mean=[0.,0.,0.], std=[1.,1.,1.], max_pixel_value=255.0),
+        ToTensorV2(),
+    ])
 
-    val_transforms = A.Compose(
-        [
-            A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-            A.Normalize(
-                mean=[0.0, 0.0, 0.0],
-                std=[1.0, 1.0, 1.0],
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ],
-    )
+    model = UNET_SNGP(
+        in_channels=3,
+        num_classes=1,
+        features=(64,128,256,512),
+        reduction_dim=args.reduction_dim,
+        rff_dim=args.rff_dim,
+        kernel_scale=None,
+        ridge=args.ridge,
+        return_variance_train=False,
+        return_variance_eval=True,
+        chunk_pixels=args.chunk_pixels,
+    ).to(DEVICE)
 
-    model = UNET(in_channels=3, out_channels=1).to(DEVICE)
     loss_fn = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    opt = optim.Adam(model.parameters(), lr=args.lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
 
     train_loader, val_loader = get_loaders(
-        TRAIN_IMG_DIR,
-        TRAIN_MASK_DIR,
-        VAL_IMG_DIR,
-        VAL_MASK_DIR,
-        BATCH_SIZE,
-        train_transform,
-        val_transforms,
-        NUM_WORKERS,
-        PIN_MEMORY,
+        TRAIN_IMG_DIR, TRAIN_MASK_DIR,
+        VAL_IMG_DIR, VAL_MASK_DIR,
+        args.batch_size, train_tf, val_tf,
+        NUM_WORKERS, PIN_MEMORY,
     )
 
-    if LOAD_MODEL:
-        load_checkpoint(torch.load("my_checkpoint.pth.tar"), model)
+    if args.load_ckpt:
+        ckpt = torch.load(RUN_DIR / "checkpoint.pth.tar", map_location=DEVICE)
+        load_checkpoint(ckpt, model)
 
-    epoch = 0
-    dice_score, accuracy = check_accuracy(val_loader, model, epoch, device=DEVICE)
-    scaler = torch.cuda.amp.GradScaler()
-    
-    # Initial TB Writes
-    # =======================================================
-    writer.add_scalars("accuracies",{"dice":dice_score, "accuracy":accuracy}, epoch)
-    log_val_preds_tb(val_loader, model, writer, epoch, DEVICE)
-    
-    initial_train_loss = eval_loss(train_loader, model, loss_fn, device=DEVICE)
-    initial_val_loss = eval_loss(val_loader, model, loss_fn, device=DEVICE)
-    writer.add_scalars("losses", {"training_loss":initial_train_loss, "val_loss":initial_val_loss}, epoch)
-    # =======================================================
-    
-    for epoch in range(NUM_EPOCHS):
-        epoch = epoch+1 # fixes 0 indexing
-        training_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler)
-        val_loss = eval_loss(val_loader, model, loss_fn, device=DEVICE)
-        #! Send loss to TB
-        writer.add_scalars("losses", {"training_loss":training_loss, "val_loss":val_loss}, epoch)
-        
-        # save model
-        checkpoint = {
-            "state_dict": model.state_dict(),
-            "optimizer":optimizer.state_dict(),
-        }
-        
-        
+    # Initial metrics
+    epoch0 = 0
+    set_variance(model, False)
+    dice0, acc0 = check_accuracy(val_loader, model, epoch0, device=DEVICE.type)
+    writer.add_scalars("accuracies", {"dice": dice0, "accuracy": acc0}, epoch0)
+    log_val_preds_tb(val_loader, model, writer, epoch0, DEVICE.type)
 
-        # check accuracy
-        dice_score, accuracy = check_accuracy(val_loader, model, epoch, device=DEVICE)
-        #! Send these to the TB
-        writer.add_scalars("accuracies",{"dice":dice_score, "accuracy":accuracy}, epoch)
-        
-        if (epoch) % 10 == 0:
-            save_checkpoint(checkpoint, run_dir=RUN_DIR)
-            
-        # print some examples to a folder
-        # preds_list = save_predictions_as_imgs(
-        #     val_loader, model, run_dir=RUN_DIR, folder="saved_images/", device=DEVICE, save = False
-        # )
-            
-        #! call helper function to display the saved images
-        # TB_preds_vis(preds_list, writer, epoch)
-        log_val_preds_tb(val_loader, model, writer, epoch, DEVICE)
+    tr0 = eval_loss(train_loader, model, loss_fn)
+    vl0 = eval_loss(val_loader, model, loss_fn)
+    writer.add_scalars("losses", {"training_loss": tr0, "val_loss": vl0}, epoch0)
 
-        # Visualize uncert
-        uncert_map_TB(val_loader, model, writer, epoch, device = DEVICE)
+    # Train
+    for ep in range(1, args.epochs + 1):
+        tr = train_epoch(train_loader, model, opt, loss_fn, scaler)
+        vl = eval_loss(val_loader, model, loss_fn)
+        writer.add_scalars("losses", {"training_loss": tr, "val_loss": vl}, ep)
+
+        # metrics
+        set_variance(model, False)
+        dice, acc = check_accuracy(val_loader, model, ep, device=DEVICE.type)
+        writer.add_scalars("accuracies", {"dice": dice, "accuracy": acc}, ep)
+
+        if ep % 10 == 0:
+            save_checkpoint({"state_dict": model.state_dict(), "optimizer": opt.state_dict()}, run_dir=RUN_DIR)
+
+        log_val_preds_tb(val_loader, model, writer, ep, DEVICE.type)
+
+    # 
+    # Final one-pass precision build
+    # 
+    def get_feats(batch_x):
+        with torch.no_grad():
+            return model.backbone_to_classifier_feats(batch_x)
+
+    model.classifier.build_precision_exact(
+        feat_loader=train_loader,
+        device=DEVICE,
+        use_amp=(DEVICE.type == "cuda"),
+        get_backbone_feats=get_feats,
+    )
+
+    # 
+    # Eval with variance
+    # 
+    model.eval()
+    set_variance(model, True)  # returns (logits, var_map)
+
+    # visualize uncertainty with your TB helper
+    log_val_preds_tb(val_loader, model, writer, args.epochs + 1, DEVICE.type)
+    uncert_map_TB(val_loader, model, writer, 10, DEVICE)
 
 if __name__ == "__main__":
     main()

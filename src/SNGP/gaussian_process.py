@@ -2,7 +2,7 @@ import math
 import torch
 from torch import nn
 from functools import partial
-from random_fourier_features import RandomFourierFeatures
+from .random_fourier_features import RandomFourierFeatures
 _SUPPORTED_LIKELIHOOD = ('binary_logistic', 'poisson', 'gaussian')
 _SUPPORTED_RBF_KERNEL_TYPES = ['gaussian', 'laplacian']
 

@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from gaussian_process import RandomFeatureGaussianProcess
+from .gaussian_process import RandomFeatureGaussianProcess
 
 import inspect
 
