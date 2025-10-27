@@ -5,9 +5,9 @@ import torch.nn as nn
 import torchvision.transforms.functional as TF
 from torch.nn.utils import spectral_norm
 
-# ---------------------------
+# 
 # Random Fourier Features φ(x)
-# ---------------------------
+# 
 class RandomFourierFeatures(nn.Module):
     """
     φ(x) = cos(x @ W + b), with W,b fixed (buffers).
@@ -39,9 +39,9 @@ class RandomFourierFeatures(nn.Module):
         return torch.cos(x @ self.weight + self.bias)  # (N, D)
 
 
-# ---------------------------------------------
+# 
 # Laplace-style precision/covariance in φ-space
-# ---------------------------------------------
+# 
 class LaplacePrecision(nn.Module):
     """
     Tracks precision  P = λ I + sum_i α_i φ_i φ_i^T  (D×D),
@@ -116,9 +116,9 @@ class LaplacePrecision(nn.Module):
         return var
 
 
-# -------------------------------
-# Purpose-built Pixel GP Head
-# -------------------------------
+# 
+# Pixel GP Head
+# 
 class PixelGPHead(nn.Module):
     """
     Drop-in replacement for a 1x1 Conv classifier in UNet.
@@ -309,7 +309,7 @@ class UNET_SNGP(nn.Module):
                 x = TF.resize(x, size=skip.shape[2:])
             x = self.ups[i + 1](torch.cat((skip, x), dim=1))
 
-        return x  # This feeds the head
+        return x  # feeds the head
 
     def forward(self, x):
         feats = self.backbone_to_classifier_feats(x)
