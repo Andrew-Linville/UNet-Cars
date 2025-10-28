@@ -3,6 +3,7 @@ data/
 saved_images/
 arc_venvs/
 logs/
+runs_archived
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
